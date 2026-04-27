@@ -4,11 +4,11 @@ import numpy as np
 
 class ColorBallDetector:
     """
-    Fast tennis ball detector using HSV color filtering + contour analysis.
+    Fast tennis ball detector using HSV color filtering + background subtraction.
 
-    Replaces TrackNet for webcam use: ~1ms per frame vs 100-500ms,
-    no model file needed, and works better when the ball is large and
-    the lighting is reasonably controlled.
+    HSV narrows candidates to yellow-green blobs; background subtraction
+    (MOG2) keeps only moving ones — eliminating static false positives such
+    as court lines, ball hoppers, and yellow clothing.
 
     Tune HSV bounds if detection is poor in your lighting:
         lower = [25, 80, 80]  →  hue 25-65 covers yellow-green
@@ -18,13 +18,17 @@ class ColorBallDetector:
     _LOWER = np.array([25,  80,  80], dtype=np.uint8)
     _UPPER = np.array([65, 255, 255], dtype=np.uint8)
 
+    # MOG2 needs ~30 frames to build a stable background model.
+    # Until then we skip the motion gate so detections still work on frame 1.
+    _BG_WARMUP = 30
+
     def __init__(self, max_dist: int = 120):
-        """
-        max_dist: maximum pixel jump allowed between frames.
-                  Detections farther than this from prev_pos are discarded as outliers.
-        """
-        self.max_dist = max_dist
-        self._kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.max_dist    = max_dist
+        self._kernel     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._bg_sub     = cv2.createBackgroundSubtractorMOG2(
+            history=60, varThreshold=20, detectShadows=False
+        )
+        self._frame_count = 0
 
     def detect(self, frame: np.ndarray,
                prev_pos: tuple = (None, None)) -> tuple:
@@ -33,13 +37,22 @@ class ColorBallDetector:
         prev_pos: last known (x, y) in pixels — used to reject far-away blobs.
         """
         h, w = frame.shape[:2]
+        self._frame_count += 1
+
+        # --- motion mask (MOG2 background subtraction) ---
+        fg = self._bg_sub.apply(frame)
+        # Dilate so a fast-moving ball isn't clipped at its edges
+        fg = cv2.dilate(fg, self._kernel, iterations=2)
 
         # --- colour mask ---
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._LOWER, self._UPPER)
-        # Close small gaps, remove noise
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._kernel)
+
+        # --- combine: yellow AND moving (skip motion gate during warmup) ---
+        if self._frame_count > self._BG_WARMUP:
+            mask = cv2.bitwise_and(mask, fg)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
