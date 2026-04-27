@@ -38,6 +38,7 @@ from coach.coaching.ai_coach import AICoach
 from coach.output.audio_feedback import AudioFeedback
 from coach.output.overlay import Overlay
 from coach.coaching import session_report
+from coach.detectors.calibration import CalibrationMode
 
 
 # ---------------------------------------------------------------- background threads
@@ -177,6 +178,8 @@ def _parse_args():
                    help="Also write annotated video to this file")
     p.add_argument('--max-frames', type=int, default=0,
                    help="Stop after this many frames (0 = process entire video)")
+    p.add_argument('--no-calibrate', action='store_true',
+                   help="Skip the 5-second calibration step (webcam only)")
     return p.parse_args()
 
 
@@ -217,12 +220,22 @@ def main():
     if audio:
         audio.start()
 
+    is_file = (args.source != 'webcam')
+
+    # ---- calibration (webcam only) ----
+    # For video files this makes no sense — you can't stand in front of a recording.
+    if not is_file and not args.no_calibrate:
+        print("[Coach] Starting 5-second calibration — stand straight, face the camera.")
+        cal_data = CalibrationMode().run(cap, pose_det, frame_w, frame_h)
+        engine.apply_calibration(cal_data)
+    elif is_file:
+        print("[Coach] File source — skipping calibration, using default thresholds.")
+
     # For video files, read frames sequentially in the main loop.
     # _CaptureThread (drains buffer continuously) is only useful for webcam,
     # where it prevents stale frames from accumulating.  For a file it reads
     # frames faster than real-time, causing every main-loop iteration to see
     # a frame many positions ahead — making the video play at several × speed.
-    is_file   = (args.source != 'webcam')
     capture_t = None if is_file else _CaptureThread(cap)
     pose_t    = _PoseThread(pose_det)
     ball_t    = _BallThread(ball_det)

@@ -55,6 +55,13 @@ class CoachingEngine:
         self._tip_counts: dict[str, int] = {}
         self._swing_metrics_log: list[dict] = []   # one entry per shot, for report
 
+    # --------------------------------------------------------------- calibration
+
+    def apply_calibration(self, data) -> None:
+        """Propagate CalibrationData to all analyzers that use body proportions."""
+        self.swing.apply_calibration(data)
+        self.footwork.apply_calibration(data)
+
     # ------------------------------------------------------------------ main
 
     def process_frame(

@@ -21,10 +21,30 @@ class FootworkAnalyzer:
     """
 
     def __init__(self, history_len: int = 90):
-        self._history: deque = deque(maxlen=history_len)   # (cx, cy, frame_idx) or None
-        self._home: tuple | None = None   # baseline center position
+        self._history: deque = deque(maxlen=history_len)
+        self._home: tuple | None = None
         self._frame_idx: int = 0
-        self._home_sample_frames = 20     # frames before we lock in home position
+        self._home_sample_frames = 20
+        # stance thresholds (may be adjusted by calibration)
+        self._stance_min = _STANCE_MIN
+        self._stance_max = _STANCE_MAX
+
+    def apply_calibration(self, data) -> None:
+        """
+        Scale stance-width thresholds to the player's measured shoulder width
+        so that narrow- or broad-shouldered players aren't misjudged.
+        """
+        if not data.valid:
+            return
+        # Population mean shoulder width ≈ 0.20 normalised.
+        # Scale both thresholds by the same ratio so relative advice stays valid.
+        ratio = max(0.7, min(1.4, data.shoulder_width_norm / 0.20))
+        self._stance_min = round(_STANCE_MIN * ratio, 4)
+        self._stance_max = round(_STANCE_MAX * ratio, 4)
+        print(
+            f"[FootworkAnalyzer] calibrated — "
+            f"stance_min={self._stance_min:.3f}  stance_max={self._stance_max:.3f}"
+        )
 
     # ------------------------------------------------------------------ update
 
@@ -127,9 +147,9 @@ class FootworkAnalyzer:
 
         stance = metrics.get('stance_width')
         if stance is not None:
-            if stance < _STANCE_MIN:
+            if stance < self._stance_min:
                 tips.append(('high',   "Widen your stance — feet should be shoulder-width apart"))
-            elif stance > _STANCE_MAX:
+            elif stance > self._stance_max:
                 tips.append(('medium', "Narrow your stance — you're too wide to push off quickly"))
 
         if metrics.get('idle_ratio', 0.0) > 0.65:

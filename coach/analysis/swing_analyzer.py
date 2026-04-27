@@ -38,8 +38,33 @@ class SwingAnalyzer:
         if dominant_hand not in ('right', 'left'):
             raise ValueError("dominant_hand must be 'right' or 'left'")
         self.dominant_hand = dominant_hand
-        self._prev_wrist_y = None   # for follow-through detection
-        self._wrist_peak_y = None   # highest (lowest y-value) wrist reached
+        self._prev_wrist_y = None
+        self._wrist_peak_y = None
+
+    def apply_calibration(self, data) -> None:
+        """
+        Shift knee and elbow thresholds relative to the player's measured
+        natural standing angles so coaching cues are body-proportional.
+        """
+        if not data.valid:
+            return
+
+        # Knee: flag "too straight" if within 10° of their natural standing angle,
+        # and "too low" if 70° below it (unusually deep crouch).
+        self.KNEE_STRAIGHT = round(data.natural_knee_angle - 10, 1)
+        self.KNEE_OVERLOW  = round(data.natural_knee_angle - 70, 1)
+
+        # Elbow min: longer-armed players naturally contact at a slightly smaller
+        # elbow angle.  Scale proportionally vs the population mean (~0.35 norm).
+        arm_ratio      = max(0.7, min(1.3, data.arm_length_norm / 0.35))
+        self.ELBOW_MIN = round(95 * arm_ratio)
+
+        print(
+            f"[SwingAnalyzer] calibrated — "
+            f"knee_straight={self.KNEE_STRAIGHT}°  "
+            f"knee_overlow={self.KNEE_OVERLOW}°  "
+            f"elbow_min={self.ELBOW_MIN}°"
+        )
 
     def _arm_landmarks(self, lm: np.ndarray):
         """Return (shoulder, elbow, wrist, hip, knee, ankle) for dominant arm."""
