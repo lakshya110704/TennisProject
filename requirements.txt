@@ -1,0 +1,11 @@
+opencv-python
+torch
+torchvision
+numpy
+pandas
+scipy
+catboost
+scikit-learn
+mediapipe
+anthropic
+pyttsx3
