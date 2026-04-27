@@ -23,6 +23,21 @@ _TIP_COLOR = {
 # Ball trail: most-recent dot is brightest yellow, oldest is dark
 _TRAIL_LEN = 12
 
+# Swing phase timeline
+_PHASES = ['idle', 'backswing', 'swing', 'follow_through']
+_PHASE_LABELS = {
+    'idle':           'Preparation',
+    'backswing':      'Backswing',
+    'swing':          'Contact',
+    'follow_through': 'Follow-Through',
+}
+_PHASE_COLOR = {
+    'idle':           (160, 160, 160),  # gray
+    'backswing':      (0,   165, 255),  # orange
+    'swing':          (0,    60, 220),  # red
+    'follow_through': (0,   200, 100),  # green
+}
+
 
 class Overlay:
     """
@@ -64,8 +79,8 @@ class Overlay:
             self._draw_skeleton(frame, landmarks)
 
         self._draw_ball_trail(frame)
-
-        self._draw_stats_hud(frame, metrics, phase, shot_count)
+        self._draw_phase_timeline(frame, phase)
+        self._draw_stats_hud(frame, metrics, shot_count)
 
         if active_tip is not None:
             self._draw_tip_panel(frame, active_tip)
@@ -148,14 +163,59 @@ class Overlay:
             cv2.putText(frame, line, (badge_w + 12, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 240), 2, cv2.LINE_AA)
 
+    # --------------------------------------------------------------- phase timeline
+
+    def _draw_phase_timeline(self, frame: np.ndarray, phase: str):
+        """Horizontal timeline bar at the top-centre showing the 4 swing phases."""
+        h, w = frame.shape[:2]
+
+        bar_h   = 30
+        y0      = 8
+        total_w = min(w - 32, 560)
+        x0      = (w - total_w) // 2
+        seg_w   = total_w // len(_PHASES)
+        font    = cv2.FONT_HERSHEY_SIMPLEX
+        fscale  = 0.44
+        thick   = 1
+
+        for i, seg in enumerate(_PHASES):
+            sx        = x0 + i * seg_w
+            is_active = (seg == phase)
+            color     = _PHASE_COLOR[seg]
+            label     = _PHASE_LABELS[seg]
+
+            # Semi-transparent fill
+            ov = frame.copy()
+            bg = color if is_active else (20, 20, 20)
+            cv2.rectangle(ov, (sx, y0), (sx + seg_w - 3, y0 + bar_h), bg, -1)
+            alpha = 0.80 if is_active else 0.55
+            cv2.addWeighted(ov, alpha, frame, 1 - alpha, 0, frame)
+
+            # Border
+            border = color if is_active else (55, 55, 55)
+            cv2.rectangle(frame, (sx, y0), (sx + seg_w - 3, y0 + bar_h), border, 1, cv2.LINE_AA)
+
+            # Chevron connector between segments (except after last)
+            if i < len(_PHASES) - 1:
+                cx = sx + seg_w - 2
+                cy = y0 + bar_h // 2
+                pts = np.array([[cx, cy - 7], [cx + 7, cy], [cx, cy + 7]], np.int32)
+                cv2.fillPoly(frame, [pts], (55, 55, 55))
+
+            # Label text — centred in segment
+            tw, th = cv2.getTextSize(label, font, fscale, thick)[0]
+            tx = sx + (seg_w - tw) // 2
+            ty = y0 + (bar_h + th) // 2
+            text_color = (255, 255, 255) if is_active else (100, 100, 100)
+            cv2.putText(frame, label, (tx, ty), font, fscale, text_color, thick, cv2.LINE_AA)
+
     # ----------------------------------------------------------------- stats HUD
 
-    def _draw_stats_hud(self, frame: np.ndarray, metrics: dict, phase: str, shot_count: int):
-        """Top-right corner: swing phase, shot counter, and key metric values."""
+    def _draw_stats_hud(self, frame: np.ndarray, metrics: dict, shot_count: int):
+        """Top-right corner: shot counter and key metric values (phase shown in timeline)."""
         fps = metrics.get('fps')
         lines = [
             f"FPS   : {fps:.0f}" if fps is not None else "FPS   : --",
-            f"Phase : {phase}",
             f"Shots : {shot_count}",
         ]
 
