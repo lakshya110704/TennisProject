@@ -144,7 +144,12 @@ class ShotDetector:
         return dist < self.frame_w * self.BALL_PROXIMITY_RATIO
 
     def _classify(self, ball_pos: tuple, landmarks: np.ndarray | None) -> str:
-        """Classify shot type from ball & body geometry."""
+        """
+        Classify shot type using three signals:
+          1. Ball height      → Serve / Overhead
+          2. Wrist x-range    → Volley (compact swing)
+          3. Wrist swing dir  → Forehand vs Backhand (tiebreak: ball side)
+        """
         if landmarks is None or ball_pos[0] is None:
             return 'Unknown'
 
@@ -153,16 +158,35 @@ class ShotDetector:
         r_hip      = landmarks[_R_HIP][:2]
         l_hip      = landmarks[_L_HIP][:2]
 
-        shoulder_y_norm = float((r_shoulder[1] + l_shoulder[1]) / 2)
-        ball_norm_x     = ball_pos[0] / self.frame_w
-        ball_norm_y     = ball_pos[1] / self.frame_h
-        body_cx         = float((r_hip[0] + l_hip[0]) / 2)
+        shoulder_y  = float((r_shoulder[1] + l_shoulder[1]) / 2)
+        ball_norm_x = ball_pos[0] / self.frame_w
+        ball_norm_y = ball_pos[1] / self.frame_h
+        body_cx     = float((r_hip[0] + l_hip[0]) / 2)
 
-        # Ball above shoulder → serve or overhead
-        if ball_norm_y < shoulder_y_norm - 0.08:
+        # 1. Serve / Overhead — ball well above shoulder line
+        if ball_norm_y < shoulder_y - 0.10:
             return 'Serve / Overhead'
 
-        # Forehand: ball on same side as dominant hand; backhand: opposite
+        # Wrist travel over recent history
+        valid    = [p for p in self._wrist_history if p is not None]
+        swing_dx = 0.0
+        x_range  = 0.0
+        if len(valid) >= 2:
+            swing_dx = valid[-1][0] - valid[0][0]   # positive = moving right
+            x_range  = max(p[0] for p in valid) - min(p[0] for p in valid)
+
+        # 2. Volley — wrist barely moved laterally (compact punch)
+        if len(valid) >= 4 and x_range < 0.07:
+            return 'Volley'
+
+        # 3. Forehand vs Backhand
+        #    Primary: swing direction (where the wrist is heading at contact)
+        #    Tiebreak: which side of the body the ball is on
         if self.dominant_hand == 'right':
-            return 'Forehand' if ball_norm_x >= body_cx else 'Backhand'
-        return 'Forehand' if ball_norm_x <= body_cx else 'Backhand'
+            wrist_fh = swing_dx < -0.01   # wrist sweeping left = forehand follow-through
+            ball_fh  = ball_norm_x >= body_cx
+            return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'
+        else:
+            wrist_fh = swing_dx > 0.01
+            ball_fh  = ball_norm_x <= body_cx
+            return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'

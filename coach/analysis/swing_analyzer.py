@@ -125,6 +125,44 @@ class SwingAnalyzer:
             'arm_extension': arm_extension,
         }
 
+    def get_shot_feedback(self, metrics: dict, shot_type: str) -> list[tuple[str, str]]:
+        """
+        Return (priority, message) tips tailored to the specific shot type.
+        Called once per detected shot event (not every frame).
+        """
+        if not metrics or not shot_type:
+            return []
+        tips = []
+        elbow = metrics.get('elbow_angle')
+        knee  = metrics.get('knee_angle')
+        rot   = metrics.get('shoulder_rotation')
+
+        if shot_type == 'Serve / Overhead':
+            if not metrics.get('wrist_above_shoulder'):
+                tips.append(('high',   "On your serve, reach up — extend fully to the ball"))
+            if rot is not None and rot < 25:
+                tips.append(('medium', "Load your shoulder on the serve — rotate before you swing"))
+
+        elif shot_type == 'Forehand':
+            if metrics.get('contact_in_front') is False:
+                tips.append(('high',   "Hit the forehand out front — ball is getting behind you"))
+            if not metrics.get('wrist_above_shoulder'):
+                tips.append(('medium', "Finish high on your forehand — wrist above shoulder"))
+
+        elif shot_type == 'Backhand':
+            if elbow is not None and elbow < 100:
+                tips.append(('high',   "Extend through your backhand — arm too bent at contact"))
+            if rot is not None and rot < 20:
+                tips.append(('medium', "Turn your shoulders on the backhand for more power"))
+
+        elif shot_type == 'Volley':
+            if elbow is not None and elbow < 110:
+                tips.append(('medium', "Keep your arm firm on volleys — avoid bending too much"))
+            if knee is not None and knee > 160:
+                tips.append(('high',   "Bend your knees at the net — get low to the volley"))
+
+        return tips
+
     def get_feedback(self, metrics: dict) -> list[tuple[str, str]]:
         """
         Return a list of (priority, message) tuples.

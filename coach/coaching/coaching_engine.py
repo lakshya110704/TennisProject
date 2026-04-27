@@ -89,13 +89,15 @@ class CoachingEngine:
         if is_bounce:
             self.bounce_count += 1
 
-        # log swing metrics at moment of contact for session report
+        # log swing metrics + inject stroke-specific tips at moment of contact
         if shot_event and swing_metrics:
             self._swing_metrics_log.append({
                 'frame':      shot_event.frame_idx,
                 'shot_type':  shot_event.shot_type,
                 **swing_metrics,
             })
+            for priority, msg in self.swing.get_shot_feedback(swing_metrics, shot_event.shot_type):
+                self._enqueue(Tip(msg, priority, 'swing'), now)
 
         # ---------- inject AI tip if one arrived ----------
         if self._ai_tip_queued:
