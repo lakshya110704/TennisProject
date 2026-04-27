@@ -9,20 +9,28 @@ Usage:
     python live_coach.py --no-audio --no-ai       # rule-based only, silent
     python live_coach.py --save out.mp4           # save annotated video
 """
+import os
+import warnings
+import logging
+
+# Must be set before any mediapipe / TF / absl import
+os.environ["GLOG_minloglevel"]    = "3"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
+logging.getLogger("absl").setLevel(logging.ERROR)
+
 import argparse
 import sys
-import os
 import queue
 import threading
 import time
 import cv2
 import numpy as np
-import torch
 from collections import deque
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-from coach.detectors.ball_detector import BallDetector
+from coach.detectors.ball_detector import ColorBallDetector
 from coach.detectors.bounce_detector import BounceDetector
 from coach.detectors.pose_detection import PoseDetector
 from coach.coaching.coaching_engine import CoachingEngine
@@ -32,47 +40,34 @@ from coach.output.overlay import Overlay
 from coach.coaching import session_report
 
 
-# ---------------------------------------------------------------- ball inference
-
-def _infer_ball_frame(
-    detector: BallDetector,
-    frames: list,           # already resized to (detector.width, detector.height)
-    prev_pred: list,
-) -> tuple[tuple, list]:
-    imgs = np.concatenate((frames[2], frames[1], frames[0]), axis=2).astype(np.float32) / 255.0
-    imgs = np.rollaxis(imgs, 2, 0)
-    inp  = np.expand_dims(imgs, axis=0)
-
-    with torch.no_grad():
-        out = detector.model(torch.from_numpy(inp).float().to(detector.device))
-
-    output = out.argmax(dim=1).detach().cpu().numpy()
-    x, y = detector.postprocess(output, prev_pred)
-    return (x, y), ([x, y] if x is not None else prev_pred)
-
-
 # ---------------------------------------------------------------- background threads
 
 class _CaptureThread:
     """
     Continuously drains the camera buffer and keeps only the latest frame.
-    Without this, slow processing causes cap.read() to return frames that
-    are several seconds old.
+    Without this, slow processing causes cap.read() to return stale frames.
     """
     def __init__(self, cap: cv2.VideoCapture):
-        self._cap   = cap
-        self._frame = None
-        self._lock  = threading.Lock()
-        self._stop  = threading.Event()
-        self._t     = threading.Thread(target=self._run, daemon=True, name="capture")
+        self._cap    = cap
+        self._frame  = None
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._ended  = False          # set when source runs out of frames
+        self._t      = threading.Thread(target=self._run, daemon=True, name="capture")
         self._t.start()
 
     def _run(self):
         while not self._stop.is_set():
             ret, frame = self._cap.read()
-            if ret:
-                with self._lock:
-                    self._frame = frame
+            if not ret:
+                self._ended = True    # video finished or cap released
+                break
+            with self._lock:
+                self._frame = frame
+
+    @property
+    def ended(self) -> bool:
+        return self._ended
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         with self._lock:
@@ -82,13 +77,12 @@ class _CaptureThread:
 
     def stop(self):
         self._stop.set()
+        self._cap.release()   # unblocks cap.read() immediately so the thread exits
+        self._t.join(timeout=2.0)
 
 
 class _PoseThread:
-    """
-    Runs MediaPipe pose detection in a background thread.
-    Push a frame in; read back the latest landmarks without blocking.
-    """
+    """Runs MediaPipe pose detection in a background thread."""
     def __init__(self, detector: PoseDetector):
         self._detector  = detector
         self._q         = queue.Queue(maxsize=1)
@@ -120,31 +114,29 @@ class _PoseThread:
 
     def stop(self):
         self._stop.set()
+        self._t.join(timeout=2.0)
 
 
 class _BallThread:
     """
-    Runs TrackNet inference in a background thread.
-    Accepts pre-resized frames (640×360) to reduce copy cost.
-    Stale frames are dropped (queue depth = 1) so inference always works on
-    the most recent frame available.
+    Runs ColorBallDetector in a background thread.
+    ~1ms per frame — far cheaper than TrackNet.
+    Stale frames are dropped (queue depth = 1).
     """
-    def __init__(self, detector: BallDetector):
-        self._detector  = detector
-        self._q         = queue.Queue(maxsize=1)
-        self._ball_pos  = (None, None)
-        self._lock      = threading.Lock()
-        self._stop      = threading.Event()
-        self._buf       = deque(maxlen=3)
-        self._prev_pred = [None, None]
-        self._t         = threading.Thread(target=self._run, daemon=True, name="ball-det")
+    def __init__(self, detector: ColorBallDetector):
+        self._detector = detector
+        self._q        = queue.Queue(maxsize=1)
+        self._ball_pos = (None, None)
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._t        = threading.Thread(target=self._run, daemon=True, name="ball-det")
         self._t.start()
 
     def push(self, frame: np.ndarray):
         try:
             self._q.put_nowait(frame)
         except queue.Full:
-            pass   # drop stale frame — the next one will be fresher
+            pass
 
     def get_pos(self) -> tuple:
         with self._lock:
@@ -156,16 +148,15 @@ class _BallThread:
                 frame = self._q.get(timeout=0.1)
             except queue.Empty:
                 continue
-            self._buf.append(frame)
-            if len(self._buf) == 3:
-                pos, self._prev_pred = _infer_ball_frame(
-                    self._detector, list(self._buf), self._prev_pred
-                )
-                with self._lock:
-                    self._ball_pos = pos
+            with self._lock:
+                prev = self._ball_pos
+            pos = self._detector.detect(frame, prev)
+            with self._lock:
+                self._ball_pos = pos
 
     def stop(self):
         self._stop.set()
+        self._t.join(timeout=2.0)
 
 
 # ---------------------------------------------------------------- argument parsing
@@ -210,20 +201,12 @@ def main():
     print(f"[Coach] Source : {args.source}  {frame_w}×{frame_h} @ {fps:.0f} fps")
     print(f"[Coach] Hand   : {args.hand}   Audio: {not args.no_audio}   AI: {not args.no_ai}")
 
-    # ---- models ----
-    if torch.backends.mps.is_available():
-        device = 'mps'
-    elif torch.cuda.is_available():
-        device = 'cuda'
-    else:
-        device = 'cpu'
-    if device == 'cpu':
-        print("[Coach] Warning: no GPU found — TrackNet will run slowly on CPU")
-    print(f"[Coach] Loading models ({device})…")
-    ball_det   = BallDetector(f'{args.model_dir}/ball_model.pt', device=device)
+    # ---- detectors ----
+    print("[Coach] Initialising detectors…")
+    ball_det   = ColorBallDetector()
     bounce_det = BounceDetector(f'{args.model_dir}/bounce_model.cbm')
     pose_det   = PoseDetector()
-    print("[Coach] Models ready.")
+    print("[Coach] Ready.")
 
     # ---- coaching layer ----
     engine   = CoachingEngine(dominant_hand=args.hand, frame_w=frame_w, frame_h=frame_h)
@@ -234,11 +217,15 @@ def main():
     if audio:
         audio.start()
 
-    # ---- background threads ----
-    capture_t = _CaptureThread(cap)
+    # For video files, read frames sequentially in the main loop.
+    # _CaptureThread (drains buffer continuously) is only useful for webcam,
+    # where it prevents stale frames from accumulating.  For a file it reads
+    # frames faster than real-time, causing every main-loop iteration to see
+    # a frame many positions ahead — making the video play at several × speed.
+    is_file   = (args.source != 'webcam')
+    capture_t = None if is_file else _CaptureThread(cap)
     pose_t    = _PoseThread(pose_det)
     ball_t    = _BallThread(ball_det)
-    _BALL_W, _BALL_H = ball_det.width, ball_det.height   # 640×360
 
     # ---- optional video writer ----
     writer = None
@@ -260,34 +247,50 @@ def main():
     last_active_msg: str | None = None
     frame_idx = 0
 
-    # Wait for first frame before entering loop
-    while True:
-        ret, _ = capture_t.read()
-        if ret:
-            break
-        time.sleep(0.01)
+    # Audio: only speak high/ai tips, at most once every N seconds
+    AUDIO_COOLDOWN  = 2.0
+    last_audio_time = 0.0
+
+    # Frame rate limiter — keeps video playing at its native speed
+    frame_delay = 1.0 / fps
+
+    # FPS tracking
+    fps_time  = time.time()
+    fps_count = 0
+    fps_display = 0.0
+
+    # Wait for first frame (webcam only — file reads are immediate)
+    if capture_t is not None:
+        while True:
+            ret, _ = capture_t.read()
+            if ret:
+                break
+            time.sleep(0.01)
 
     print("[Coach] Running — press Q to quit.\n")
 
     try:
         while True:
-            ret, frame = capture_t.read()
-            if not ret:
-                time.sleep(0.005)
-                continue
+            frame_start = time.time()   # used for per-frame throttle below
 
-            # ---- push full frame to pose thread ----
+            if is_file:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+            else:
+                if capture_t.ended:
+                    break
+                ret, frame = capture_t.read()
+                if not ret:
+                    time.sleep(0.005)
+                    continue
+
+            # ---- push to background threads ----
             pose_t.push(frame)
-
-            # ---- read latest landmarks from pose thread ----
             landmarks = pose_t.get_landmarks()
 
-            # ---- push pre-resized frame to ball thread (only when player visible) ----
             if landmarks is not None:
-                small = cv2.resize(frame, (_BALL_W, _BALL_H))
-                ball_t.push(small)
-
-            # ---- read latest ball position from ball thread ----
+                ball_t.push(frame)
             ball_pos = ball_t.get_pos()
 
             ball_win_x.append(ball_pos[0])
@@ -328,8 +331,21 @@ def main():
             if active_tip and active_tip.message != last_active_msg:
                 recent_tips.append(active_tip.message)
                 last_active_msg = active_tip.message
-                if audio:
+                now = time.time()
+                if (audio
+                        and active_tip.priority in ('high', 'ai')
+                        and now - last_audio_time >= AUDIO_COOLDOWN):
                     audio.speak(active_tip.message, priority=active_tip.priority)
+                    last_audio_time = now
+
+            # ---- FPS counter ----
+            fps_count += 1
+            now = time.time()
+            if now - fps_time >= 1.0:
+                fps_display = fps_count / (now - fps_time)
+                fps_count = 0
+                fps_time  = now
+            metrics['fps'] = fps_display
 
             # ---- render ----
             ov.update_ball(ball_pos)
@@ -340,7 +356,10 @@ def main():
             if writer:
                 writer.write(annotated)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Throttle to source FPS so video doesn't play faster than real-time
+            elapsed = time.time() - frame_start
+            wait_ms = max(1, int((frame_delay - elapsed) * 1000))
+            if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
                 break
 
             frame_idx += 1
@@ -349,13 +368,25 @@ def main():
                 break
 
     finally:
-        capture_t.stop()
+        if capture_t is not None:
+            capture_t.stop()   # releases cap and joins
+        else:
+            cap.release()
         pose_t.stop()
         ball_t.stop()
-        cap.release()
         cv2.destroyAllWindows()
         if writer:
             writer.release()
+
+        # Speak the single most-repeated coaching cue so the player knows
+        # what to focus on next time (tips that fired during play but were
+        # silenced by the cooldown still count in _tip_counts).
+        if audio and frame_idx > 0:
+            top = engine.get_session_summary().get('top_tips', [])
+            if top:
+                audio.speak(f"Session complete. Key focus: {top[0][0]}", priority='high')
+                time.sleep(6)   # give say time to finish before we kill the thread
+
         if audio:
             audio.stop()
 

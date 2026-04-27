@@ -152,7 +152,9 @@ class Overlay:
 
     def _draw_stats_hud(self, frame: np.ndarray, metrics: dict, phase: str, shot_count: int):
         """Top-right corner: swing phase, shot counter, and key metric values."""
+        fps = metrics.get('fps')
         lines = [
+            f"FPS   : {fps:.0f}" if fps is not None else "FPS   : --",
             f"Phase : {phase}",
             f"Shots : {shot_count}",
         ]

@@ -1,73 +1,87 @@
-from coach.detectors.tracknet import BallTrackerNet
-import torch
 import cv2
 import numpy as np
-from scipy.spatial import distance
-from tqdm import tqdm
 
-class BallDetector:
-    def __init__(self, path_model=None, device='cuda'):
-        self.model = BallTrackerNet(input_channels=9, out_channels=256)
-        self.device = device
-        if path_model:
-            self.model.load_state_dict(torch.load(path_model, map_location=device))
-            self.model = self.model.to(device)
-            self.model.eval()
-        self.width = 640
-        self.height = 360
 
-    def infer_model(self, frames):
-        """ Run pretrained model on a consecutive list of frames
-        :params
-            frames: list of consecutive video frames
-        :return
-            ball_track: list of detected ball points
+class ColorBallDetector:
+    """
+    Fast tennis ball detector using HSV color filtering + contour analysis.
+
+    Replaces TrackNet for webcam use: ~1ms per frame vs 100-500ms,
+    no model file needed, and works better when the ball is large and
+    the lighting is reasonably controlled.
+
+    Tune HSV bounds if detection is poor in your lighting:
+        lower = [25, 80, 80]  →  hue 25-65 covers yellow-green
+        upper = [65, 255, 255]
+    """
+
+    _LOWER = np.array([25,  80,  80], dtype=np.uint8)
+    _UPPER = np.array([65, 255, 255], dtype=np.uint8)
+
+    def __init__(self, max_dist: int = 120):
         """
-        ball_track = [(None, None)]*2
-        prev_pred = [None, None]
-        for num in tqdm(range(2, len(frames))):
-            img = cv2.resize(frames[num], (self.width, self.height))
-            img_prev = cv2.resize(frames[num-1], (self.width, self.height))
-            img_preprev = cv2.resize(frames[num-2], (self.width, self.height))
-            imgs = np.concatenate((img, img_prev, img_preprev), axis=2)
-            imgs = imgs.astype(np.float32)/255.0
-            imgs = np.rollaxis(imgs, 2, 0)
-            inp = np.expand_dims(imgs, axis=0)
-
-            out = self.model(torch.from_numpy(inp).float().to(self.device))
-            output = out.argmax(dim=1).detach().cpu().numpy()
-            x_pred, y_pred = self.postprocess(output, prev_pred)
-            prev_pred = [x_pred, y_pred]
-            ball_track.append((x_pred, y_pred))
-        return ball_track
-
-    def postprocess(self, feature_map, prev_pred, scale=2, max_dist=80):
+        max_dist: maximum pixel jump allowed between frames.
+                  Detections farther than this from prev_pos are discarded as outliers.
         """
-        :params
-            feature_map: feature map with shape (1,360,640)
-            prev_pred: [x,y] coordinates of ball prediction from previous frame
-            scale: scale for conversion to original shape (720,1280)
-            max_dist: maximum distance from previous ball detection to remove outliers
-        :return
-            x,y ball coordinates
+        self.max_dist = max_dist
+        self._kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    def detect(self, frame: np.ndarray,
+               prev_pos: tuple = (None, None)) -> tuple:
         """
-        feature_map *= 255
-        feature_map = feature_map.reshape((self.height, self.width))
-        feature_map = feature_map.astype(np.uint8)
-        ret, heatmap = cv2.threshold(feature_map, 127, 255, cv2.THRESH_BINARY)
-        circles = cv2.HoughCircles(heatmap, cv2.HOUGH_GRADIENT, dp=1, minDist=1, param1=50, param2=2, minRadius=2,
-                                   maxRadius=7)
-        x, y = None, None
-        if circles is not None:
-            if prev_pred[0]:
-                for i in range(len(circles[0])):
-                    x_temp = circles[0][i][0]*scale
-                    y_temp = circles[0][i][1]*scale
-                    dist = distance.euclidean((x_temp, y_temp), prev_pred)
-                    if dist < max_dist:
-                        x, y = x_temp, y_temp
-                        break                
-            else:
-                x = circles[0][0][0]*scale
-                y = circles[0][0][1]*scale
-        return x, y
+        Returns (x_px, y_px) of the ball centre, or (None, None) if not found.
+        prev_pos: last known (x, y) in pixels — used to reject far-away blobs.
+        """
+        h, w = frame.shape[:2]
+
+        # --- colour mask ---
+        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self._LOWER, self._UPPER)
+        # Close small gaps, remove noise
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return (None, None)
+
+        # --- size filter: ball radius should be 0.3%–6% of frame width ---
+        min_area = np.pi * (w * 0.003) ** 2
+        max_area = np.pi * (w * 0.06)  ** 2
+
+        candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (min_area <= area <= max_area):
+                continue
+            perimeter = cv2.arcLength(c, True)
+            if perimeter == 0:
+                continue
+            # Circularity: 1.0 = perfect circle; filter out court lines / streaks
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.35:
+                continue
+            M = cv2.moments(c)
+            if M['m00'] == 0:
+                continue
+            cx = M['m10'] / M['m00']
+            cy = M['m01'] / M['m00']
+            candidates.append((float(cx), float(cy), circularity))
+
+        if not candidates:
+            return (None, None)
+
+        # --- pick best candidate ---
+        if prev_pos[0] is not None:
+            # Prefer closest to last known position
+            best = min(candidates,
+                       key=lambda c: (c[0] - prev_pos[0])**2 + (c[1] - prev_pos[1])**2)
+            dist = np.sqrt((best[0] - prev_pos[0])**2 + (best[1] - prev_pos[1])**2)
+            if dist > self.max_dist:
+                return (None, None)   # too far — likely a false positive
+        else:
+            # No history: pick most circular blob
+            best = max(candidates, key=lambda c: c[2])
+
+        return (best[0], best[1])
