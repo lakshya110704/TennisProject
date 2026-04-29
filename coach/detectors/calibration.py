@@ -117,25 +117,30 @@ class CalibrationMode:
         h, w = frame.shape[:2]
 
         # --- top instruction banner ---
-        banner_h = 70
+        banner_h = 90
         ov = frame.copy()
         cv2.rectangle(ov, (0, 0), (w, banner_h), (10, 10, 10), -1)
         cv2.addWeighted(ov, 0.72, frame, 0.28, 0, frame)
 
         cv2.putText(frame,
                     "CALIBRATION — Stand straight, face the camera",
-                    (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68,
+                    (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68,
                     (255, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(frame,
+                    "Lift your racket to ready position and hold still",
+                    (16, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 200, 255), 1, cv2.LINE_AA)
 
         status_text  = "Pose detected" if pose_found else "No pose — step into frame"
         status_color = (0, 210, 90)    if pose_found else (0, 100, 220)
         cv2.putText(frame, status_text,
-                    (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                    (16, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                     status_color, 1, cv2.LINE_AA)
 
         frames_txt = f"{frame_count} frames collected"
         cv2.putText(frame, frames_txt,
-                    (w - 200, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (w - 200, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (140, 140, 140), 1, cv2.LINE_AA)
 
         # --- bottom progress bar ---

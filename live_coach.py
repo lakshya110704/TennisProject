@@ -180,6 +180,8 @@ def _parse_args():
                    help="Stop after this many frames (0 = process entire video)")
     p.add_argument('--no-calibrate', action='store_true',
                    help="Skip the 5-second calibration step (webcam only)")
+    p.add_argument('--swing-practice', action='store_true',
+                   help="Swing practice mode — detect shots from wrist motion only, no ball needed")
     return p.parse_args()
 
 
@@ -203,6 +205,8 @@ def main():
 
     print(f"[Coach] Source : {args.source}  {frame_w}×{frame_h} @ {fps:.0f} fps")
     print(f"[Coach] Hand   : {args.hand}   Audio: {not args.no_audio}   AI: {not args.no_ai}")
+    if args.swing_practice:
+        print("[Coach] Mode   : SWING PRACTICE — no ball needed")
 
     # ---- detectors ----
     print("[Coach] Initialising detectors…")
@@ -212,7 +216,8 @@ def main():
     print("[Coach] Ready.")
 
     # ---- coaching layer ----
-    engine   = CoachingEngine(dominant_hand=args.hand, frame_w=frame_w, frame_h=frame_h)
+    engine   = CoachingEngine(dominant_hand=args.hand, frame_w=frame_w, frame_h=frame_h,
+                              swing_practice=args.swing_practice)
     ai_coach = None if args.no_ai else AICoach()
     audio    = None if args.no_audio else AudioFeedback()
     ov       = Overlay(frame_w, frame_h)
@@ -302,9 +307,12 @@ def main():
             pose_t.push(frame)
             landmarks = pose_t.get_landmarks()
 
-            if landmarks is not None:
-                ball_t.push(frame)
-            ball_pos = ball_t.get_pos()
+            if args.swing_practice:
+                ball_pos = (None, None)
+            else:
+                if landmarks is not None:
+                    ball_t.push(frame)
+                ball_pos = ball_t.get_pos()
 
             ball_win_x.append(ball_pos[0])
             ball_win_y.append(ball_pos[1])

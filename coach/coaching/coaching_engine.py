@@ -16,7 +16,7 @@ class Tip:
 _PRIORITY_ORDER = {'high': 0, 'ai': 1, 'medium': 2, 'low': 3}
 
 # How long each priority level stays on screen (seconds)
-_DISPLAY_DURATION = {'high': 5.0, 'ai': 7.0, 'medium': 4.0, 'low': 3.0}
+_DISPLAY_DURATION = {'high': 4.0, 'ai': 6.0, 'medium': 2.5, 'low': 2.0}
 
 # How long before the same tip can appear again (seconds)
 _COOLDOWN = {'high': 30.0, 'ai': 90.0, 'medium': 25.0, 'low': 20.0}
@@ -33,10 +33,12 @@ class CoachingEngine:
     """
 
     def __init__(self, dominant_hand: str = 'right',
-                 frame_w: int = 1280, frame_h: int = 720):
+                 frame_w: int = 1280, frame_h: int = 720,
+                 swing_practice: bool = False):
         self.swing    = SwingAnalyzer(dominant_hand)
         self.footwork = FootworkAnalyzer()
-        self.shots    = ShotDetector(dominant_hand, frame_w, frame_h)
+        self.shots    = ShotDetector(dominant_hand, frame_w, frame_h,
+                                     swing_practice=swing_practice)
 
         self._active_tip: Tip | None = None
         self._tip_expiry: float = 0.0
@@ -136,6 +138,11 @@ class CoachingEngine:
             return
         self._pending.append(tip)
         self._pending.sort(key=lambda t: _PRIORITY_ORDER.get(t.priority, 99))
+        # Preempt: expire active tip immediately if incoming has higher priority
+        if (self._active_tip is not None
+                and _PRIORITY_ORDER.get(tip.priority, 99)
+                    < _PRIORITY_ORDER.get(self._active_tip.priority, 99)):
+            self._tip_expiry = now
 
     def _advance(self, now: float):
         if not self._pending:

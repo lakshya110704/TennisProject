@@ -33,17 +33,20 @@ class ShotDetector:
     WRIST_SPEED_THRESHOLD = 0.018   # normalized coords / frame
     BALL_PROXIMITY_RATIO  = 0.18    # fraction of frame width
     SHOT_COOLDOWN_FRAMES  = 20      # min frames between consecutive shots
-    HISTORY_LEN           = 8       # frames kept for wrist speed calculation
+    HISTORY_LEN           = 30      # frames kept for classification
+    _SPEED_WINDOW         = 8       # frames used for speed (avoids idle drag)
 
     def __init__(self, dominant_hand: str = 'right',
-                 frame_w: int = 1280, frame_h: int = 720):
-        self.dominant_hand = dominant_hand
-        self.frame_w = frame_w
-        self.frame_h = frame_h
+                 frame_w: int = 1280, frame_h: int = 720,
+                 swing_practice: bool = False):
+        self.dominant_hand  = dominant_hand
+        self.frame_w        = frame_w
+        self.frame_h        = frame_h
+        self.swing_practice = swing_practice
 
-        self._wrist_history: deque = deque(maxlen=self.HISTORY_LEN)  # (x, y) normalized
+        self._wrist_history: deque = deque(maxlen=self.HISTORY_LEN)
         self._last_shot_frame = -self.SHOT_COOLDOWN_FRAMES
-        self._phase = 'idle'      # 'idle' | 'backswing' | 'swing' | 'follow_through'
+        self._phase = 'idle'
 
         self.shot_count = 0
         self.shot_log: list[ShotEvent] = []
@@ -69,7 +72,7 @@ class ShotDetector:
         if wrist_speed < self.WRIST_SPEED_THRESHOLD:
             return None
 
-        if not self._ball_near_wrist(ball_pos, wrist_xy):
+        if not self.swing_practice and not self._ball_near_wrist(ball_pos, wrist_xy):
             return None
 
         # --- shot confirmed ---
@@ -108,14 +111,17 @@ class ShotDetector:
         return (float(landmarks[idx][0]), float(landmarks[idx][1]))
 
     def _compute_wrist_speed(self) -> float:
-        """Average normalized wrist speed over the last few valid frames."""
+        """Average wrist speed over the most recent _SPEED_WINDOW valid frames.
+        Using a short window avoids idle frames in the 30-frame history dragging
+        the average below the detection threshold."""
         valid = [p for p in self._wrist_history if p is not None]
-        if len(valid) < 2:
+        recent = valid[-self._SPEED_WINDOW:] if len(valid) > self._SPEED_WINDOW else valid
+        if len(recent) < 2:
             return 0.0
         speeds = []
-        for i in range(1, len(valid)):
-            dx = valid[i][0] - valid[i - 1][0]
-            dy = valid[i][1] - valid[i - 1][1]
+        for i in range(1, len(recent)):
+            dx = recent[i][0] - recent[i - 1][0]
+            dy = recent[i][1] - recent[i - 1][1]
             speeds.append(np.sqrt(dx ** 2 + dy ** 2))
         return float(np.mean(speeds))
 
@@ -146,11 +152,16 @@ class ShotDetector:
     def _classify(self, ball_pos: tuple, landmarks: np.ndarray | None) -> str:
         """
         Classify shot type using three signals:
-          1. Ball height      → Serve / Overhead
-          2. Wrist x-range    → Volley (compact swing)
-          3. Wrist swing dir  → Forehand vs Backhand (tiebreak: ball side)
+          1. Ball height        → Serve / Overhead
+          2. Wrist arc length   → Volley (compact punch over full history)
+          3. Recent swing dir   → Forehand vs Backhand (tiebreak: ball side)
+
+        Using arc length (total path traveled) for volley detection is more
+        robust than x-range because it catches diagonal punches that x-range
+        misses.  Using only the last 12 frames for swing direction avoids the
+        backswing (which goes the opposite way) contaminating the result.
         """
-        if landmarks is None or ball_pos[0] is None:
+        if landmarks is None:
             return 'Unknown'
 
         r_shoulder = landmarks[_R_SHOULDER][:2]
@@ -158,35 +169,48 @@ class ShotDetector:
         r_hip      = landmarks[_R_HIP][:2]
         l_hip      = landmarks[_L_HIP][:2]
 
-        shoulder_y  = float((r_shoulder[1] + l_shoulder[1]) / 2)
-        ball_norm_x = ball_pos[0] / self.frame_w
-        ball_norm_y = ball_pos[1] / self.frame_h
-        body_cx     = float((r_hip[0] + l_hip[0]) / 2)
+        shoulder_y = float((r_shoulder[1] + l_shoulder[1]) / 2)
+        body_cx    = float((r_hip[0] + l_hip[0]) / 2)
 
-        # 1. Serve / Overhead — ball well above shoulder line
-        if ball_norm_y < shoulder_y - 0.10:
-            return 'Serve / Overhead'
+        # 1. Serve / Overhead
+        #    With ball: ball well above shoulder line
+        #    Swing practice: dominant wrist well above shoulder (serve motion)
+        if ball_pos[0] is not None:
+            if ball_pos[1] / self.frame_h < shoulder_y - 0.10:
+                return 'Serve / Overhead'
+        else:
+            wrist_idx = _R_WRIST if self.dominant_hand == 'right' else _L_WRIST
+            if float(landmarks[wrist_idx][1]) < shoulder_y - 0.10:
+                return 'Serve / Overhead'
 
-        # Wrist travel over recent history
-        valid    = [p for p in self._wrist_history if p is not None]
-        swing_dx = 0.0
-        x_range  = 0.0
-        if len(valid) >= 2:
-            swing_dx = valid[-1][0] - valid[0][0]   # positive = moving right
-            x_range  = max(p[0] for p in valid) - min(p[0] for p in valid)
+        valid = [p for p in self._wrist_history if p is not None]
 
-        # 2. Volley — wrist barely moved laterally (compact punch)
-        if len(valid) >= 4 and x_range < 0.07:
+        # Total arc length over full 30-frame window
+        arc_len = sum(
+            np.sqrt((valid[i][0] - valid[i-1][0])**2 + (valid[i][1] - valid[i-1][1])**2)
+            for i in range(1, len(valid))
+        ) if len(valid) >= 2 else 0.0
+
+        # Swing direction: last 12 frames only (excludes backswing going the other way)
+        recent   = valid[-12:] if len(valid) >= 12 else valid
+        swing_dx = recent[-1][0] - recent[0][0] if len(recent) >= 2 else 0.0
+
+        # 2. Volley — compact punch, total wrist path is short
+        if len(valid) >= 8 and arc_len < 0.20:
             return 'Volley'
 
         # 3. Forehand vs Backhand
-        #    Primary: swing direction (where the wrist is heading at contact)
-        #    Tiebreak: which side of the body the ball is on
+        #    Primary signal: wrist swing direction
+        #    Tiebreaker: ball side of body (skipped in swing practice)
         if self.dominant_hand == 'right':
-            wrist_fh = swing_dx < -0.01   # wrist sweeping left = forehand follow-through
-            ball_fh  = ball_norm_x >= body_cx
-            return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'
+            wrist_fh = swing_dx < -0.02
+            if ball_pos[0] is not None:
+                ball_fh = ball_pos[0] / self.frame_w >= body_cx
+                return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'
+            return 'Forehand' if wrist_fh else 'Backhand'
         else:
-            wrist_fh = swing_dx > 0.01
-            ball_fh  = ball_norm_x <= body_cx
-            return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'
+            wrist_fh = swing_dx > 0.02
+            if ball_pos[0] is not None:
+                ball_fh = ball_pos[0] / self.frame_w <= body_cx
+                return 'Forehand' if (wrist_fh or ball_fh) else 'Backhand'
+            return 'Forehand' if wrist_fh else 'Backhand'
